@@ -1,0 +1,195 @@
+name: 打包安卓 App
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 取代码
+        uses: actions/checkout@v4
+
+      - name: 整理文件（按内容自动识别，文件名被改也没关系）
+        run: |
+          echo "仓库里的文件："
+          find . -path ./.git -prune -o -type f -print | sort
+          pick() { find . -path ./.git -prune -o -path ./www -prune -o -name "$1" -type f -exec grep -l "$2" {} + | head -n 1; }
+          GAME=$(pick "*.html" "makeDeck")
+          LAUNCH=$(pick "*.html" 'content="qmeng-launcher"')
+          PRIV=$(pick "*.html" 'content="qmeng-privacy"')
+          CONF=$(pick "*.js" "APP_CONFIG")
+          if [ -z "$GAME" ]; then echo "::error::没有找到游戏文件 game.html，请先上传"; exit 1; fi
+          mkdir -p www
+          echo "游戏：$GAME"; cp "$GAME" www/game.html
+          if [ -n "$LAUNCH" ]; then echo "启动页：$LAUNCH"; cp "$LAUNCH" www/index.html
+          else echo "::warning::没有找到启动页 index.html（隐私政策弹窗），将直接进入游戏"; cp www/game.html www/index.html; fi
+          if [ -n "$PRIV" ]; then echo "隐私政策：$PRIV"; cp "$PRIV" www/privacy.html; else echo "::warning::没有找到 privacy.html"; fi
+
+          if [ -n "$CONF" ]; then echo "开发者信息：$CONF"; cp "$CONF" www/config.js; else echo "window.APP_CONFIG={};" > www/config.js; fi
+          find . -maxdepth 1 -name "*.zip" -type f | while read -r z; do
+            if unzip -l "$z" | grep -q " resources/"; then echo "图标包：$z"; unzip -o -q "$z" "resources/*" -d .; break; fi
+          done
+          [ -d resources ] || echo "::warning::没有找到图标包 app-resources.zip，将使用默认图标"
+
+      - name: 手机端设置（禁止缩放、禁止长按菜单）
+        run: |
+          python3 - << 'PY'
+          p = "www/game.html"
+          h = open(p, encoding="utf-8").read()
+          h = h.replace('initial-scale=1, viewport-fit=cover', 'initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover', 1)
+          h = h.replace('</head>', '<style>body{-webkit-touch-callout:none}</style>\n'
+                        '<script>document.addEventListener("contextmenu",function(e){e.preventDefault()});</script>\n</head>', 1)
+          open(p, "w", encoding="utf-8").write(h)
+          print("已完成")
+          PY
+
+      - name: 生成 App 配置
+        run: |
+          cat > package.json << 'EOF'
+          {
+            "name": "qmeng-guandan",
+            "version": "1.0.0",
+            "private": true,
+            "dependencies": {
+              "@capacitor/android": "8.5.3",
+              "@capacitor/cli": "8.5.3",
+              "@capacitor/core": "8.5.3",
+              "@fontsource/baloo-2": "5.3.0",
+              "@fontsource/zcool-kuaile": "5.3.0"
+            }
+
+          }
+          EOF
+          cat > capacitor.config.json << 'EOF'
+          {
+            "appId": "com.qmeng.guandan",
+            "appName": "Q萌掼蛋",
+            "webDir": "www",
+            "android": { "backgroundColor": "#1F9C86" }
+          }
+          EOF
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: 安装 Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: 安装 Capacitor
+        run: npm install --no-audit --no-fund
+
+      - name: 内置字体（失败也不影响打包）
+        run: |
+          python3 - << 'PY'
+          import os, re, shutil
+
+          HTML = "www/game.html"
+          OUT = "www/fonts"
+
+          NM = "node_modules/@fontsource"
+          SOURCES = [("zcool-kuaile", "index.css"), ("baloo-2", "latin-700.css"), ("baloo-2", "latin-800.css")]
+          LINK = r'<link href="https://fonts\.googleapis\.com/css2[^"]+" rel="stylesheet">'
+
+          html = open(HTML, encoding="utf-8").read()
+          try:
+              os.makedirs(OUT, exist_ok=True)
+              parts, n = [], 0
+              for pkg, css_name in SOURCES:
+                  css = open(os.path.join(NM, pkg, css_name), encoding="utf-8").read()
+                  css = re.sub(r",\s*url\(\./files/[^)]+\.woff\)\s*format\('woff'\)", "", css)
+                  for f in sorted(set(re.findall(r"url\(\./files/([^)]+\.woff2)\)", css))):
+                      shutil.copy(os.path.join(NM, pkg, "files", f), os.path.join(OUT, f))
+                      n += 1
+                  parts.append(css.replace("url(./files/", "url("))
+              open(os.path.join(OUT, "fonts.css"), "w", encoding="utf-8").write("\n".join(parts))
+              html, k = re.subn(LINK, '<link href="fonts/fonts.css" rel="stylesheet">', html)
+              if not k:
+                  html = html.replace("</head>", '<link href="fonts/fonts.css" rel="stylesheet">\n</head>', 1)
+              print(f"字体已内置，共 {n} 个文件")
+          except Exception as e:
+              print("字体内置失败，改用手机自带字体：", e)
+              html = re.sub(LINK + r"\s*", "", html)
+          html = re.sub(r'<link rel="preconnect"[^>]*>\s*', "", html)
+          open(HTML, "w", encoding="utf-8").write(html)
+          PY
+
+      - name: 生成安卓工程
+        run: npx cap add android
+
+      - name: 设置版本号（每次打包自动加 1）
+        run: |
+
+          sed -i "s/versionCode 1$/versionCode ${{ github.run_number }}/" android/app/build.gradle
+          sed -i "s/versionName \"1.0\"/versionName \"1.0.${{ github.run_number }}\"/" android/app/build.gradle
+          grep -n "versionCode\|versionName" android/app/build.gradle
+
+      - name: 换上图标和启动图
+        run: |
+          if [ -d resources/android/res ]; then
+            rm -f android/app/src/main/res/drawable-v24/ic_launcher_foreground.xml
+            cp -r resources/android/res/. android/app/src/main/res/
+          else
+            echo "使用默认图标"
+          fi
+
+      - name: 同步网页到安卓工程
+        run: npx cap sync android
+
+      - name: 准备调试签名（没有正式密钥时使用）
+        run: |
+          if [ -f resources/debug.keystore ]; then
+            mkdir -p ~/.android
+            cp resources/debug.keystore ~/.android/debug.keystore
+          fi
+
+      - name: 接受 Android SDK 许可
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: 编译 APK（有密钥就出正式签名版）
+        working-directory: android
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          chmod +x gradlew
+          if [ -n "$KS_B64" ]; then
+            echo "使用正式签名"
+            echo "$KS_B64" | base64 -d > release.keystore
+            ./gradlew assembleRelease --no-daemon
+            BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
+            "$BT/zipalign" -p -f 4 app/build/outputs/apk/release/app-release-unsigned.apk aligned.apk
+            "$BT/apksigner" sign --ks release.keystore --ks-pass env:KS_PASS --key-pass env:KS_PASS --ks-key-alias "$KEY_ALIAS" --out ../QMengGuandan.apk aligned.apk
+            "$BT/apksigner" verify --print-certs ../QMengGuandan.apk
+            rm -f release.keystore
+          else
+            echo "::warning::没有设置签名密钥，本次生成的是调试版，只能自己安装，不能上架商店"
+            ./gradlew assembleDebug --no-daemon
+            cp app/build/outputs/apk/debug/app-debug.apk ../QMengGuandan.apk
+          fi
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: QMengGuandan-apk
+          path: QMengGuandan.apk
+
+      - name: 发布到 Releases（手机可直接下载）
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: Q萌掼蛋 v1.0.${{ github.run_number }}
+          files: QMengGuandan.apk
